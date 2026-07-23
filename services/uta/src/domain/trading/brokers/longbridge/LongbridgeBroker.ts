@@ -19,6 +19,7 @@ import { z } from 'zod'
 import Decimal from 'decimal.js'
 import { Contract, ContractDescription, ContractDetails, Order, UNSET_DECIMAL } from '@traderalice/ibkr'
 import {
+  Decimal as LongbridgeDecimal,
   Config,
   TradeContext,
   QuoteContext,
@@ -39,6 +40,8 @@ import {
   type Quote,
   type MarketClock,
   type TpSlParams,
+  type BarParams,
+  type Bar,
 } from '../types.js'
 import '../../contract-ext.js'
 import { buildPosition } from '../contract-builder.js'
@@ -62,11 +65,37 @@ import type {
   LongbridgeStaticInfoLike,
   LongbridgeOptionQuoteLike,
   LongbridgeWarrantQuoteLike,
+  LongbridgeCandlestickLike,
 } from './longbridge-types.js'
 
 // Longbridge SDK DerivativeType enum (mirrors `const enum DerivativeType`).
 const DERIVATIVE_OPTION = 0
 const DERIVATIVE_WARRANT = 1
+
+// Longbridge SDK Period enum values (mirrors `const enum Period` from longbridge SDK).
+// SDK: Unknown=0, Min_1=1, Min_2=2, Min_3=3, Min_5=4, Min_10=5, Min_15=6, Min_20=7,
+//      Min_30=8, Min_45=9, Min_60=10, Min_120=11, Min_180=12, Min_240=13,
+//      Day=14, Week=15, Month=16, Quarter=17, Year=18
+const LB_PERIOD_MIN1 = 1
+const LB_PERIOD_MIN5 = 4
+const LB_PERIOD_MIN15 = 6
+const LB_PERIOD_MIN30 = 8
+const LB_PERIOD_MIN60 = 10
+const LB_PERIOD_DAY = 14
+const LB_PERIOD_WEEK = 15
+
+// Longbridge SDK AdjustType enum values (mirrors `const enum AdjustType`).
+// SDK: NoAdjust=0, ForwardAdjust=1
+const LB_ADJUST_NO_ADJUST = 0
+
+// Longbridge SDK TradeSessions enum (mirrors `const enum TradeSessions`).
+// SDK: Intraday=0, All=1
+const LB_TRADE_SESSIONS_ALL = 1
+
+/** Convert an OpenAlice `decimal.js` Decimal to a Longbridge SDK native Decimal at the write boundary. */
+function toLongbridgeDecimal(value: Decimal): LongbridgeDecimal {
+  return new LongbridgeDecimal(value.toString())
+}
 
 // ==================== Order-type translation ====================
 
@@ -294,11 +323,11 @@ export class LongbridgeBroker implements IBroker {
       orderType: lbType,
       side,
       timeInForce: lbTif,
-      submittedQuantity: order.totalQuantity as unknown as never,  // SDK accepts decimal.js or its own Decimal
+      submittedQuantity: toLongbridgeDecimal(order.totalQuantity) as unknown as never,
     }
-    if (!order.lmtPrice.equals(UNSET_DECIMAL)) opts.submittedPrice = order.lmtPrice as unknown as never
-    if (!order.auxPrice.equals(UNSET_DECIMAL)) opts.triggerPrice = order.auxPrice as unknown as never
-    if (!order.trailingPercent.equals(UNSET_DECIMAL)) opts.trailingPercent = order.trailingPercent as unknown as never
+    if (!order.lmtPrice.equals(UNSET_DECIMAL)) opts.submittedPrice = toLongbridgeDecimal(order.lmtPrice) as unknown as never
+    if (!order.auxPrice.equals(UNSET_DECIMAL)) opts.triggerPrice = toLongbridgeDecimal(order.auxPrice) as unknown as never
+    if (!order.trailingPercent.equals(UNSET_DECIMAL)) opts.trailingPercent = toLongbridgeDecimal(order.trailingPercent) as unknown as never
 
     try {
       const resp = await this.tradeCtx.submitOrder(opts)
@@ -318,13 +347,13 @@ export class LongbridgeBroker implements IBroker {
     }
     const opts: ReplaceOrderOptions = {
       orderId,
-      quantity: changes.totalQuantity as unknown as never,
+      quantity: toLongbridgeDecimal(changes.totalQuantity) as unknown as never,
     }
     if (changes.lmtPrice != null && !changes.lmtPrice.equals(UNSET_DECIMAL)) {
-      opts.price = changes.lmtPrice as unknown as never
+      opts.price = toLongbridgeDecimal(changes.lmtPrice) as unknown as never
     }
     if (changes.auxPrice != null && !changes.auxPrice.equals(UNSET_DECIMAL)) {
-      opts.triggerPrice = changes.auxPrice as unknown as never
+      opts.triggerPrice = toLongbridgeDecimal(changes.auxPrice) as unknown as never
     }
     try {
       await this.tradeCtx.replaceOrder(opts)
@@ -677,6 +706,45 @@ export class LongbridgeBroker implements IBroker {
     return {
       supportedSecTypes: ['STK'],
       supportedOrderTypes: ['MKT', 'LMT', 'STP', 'STP LMT', 'TRAIL'],
+      historicalBars: {
+        supported: true,
+        quality: 'realtime',
+        supportedBarSizes: ['1m', '5m', '15m', '30m', '1h', '1d', '1w'],
+      },
+    }
+  }
+
+  // ---- Historical bars ----
+
+  async getHistorical(contract: Contract, params: BarParams): Promise<Bar[]> {
+    const symbol = resolveSymbol(contract)
+    if (!symbol) throw new BrokerError('EXCHANGE', 'Cannot resolve contract to Longbridge symbol')
+
+    const period = barIntervalToLbPeriod(params.interval)
+    if (period == null) {
+      throw new BrokerError('CONFIG', `Bar interval "${params.interval}" is not supported by Longbridge`)
+    }
+
+    const count = params.limit ?? 100
+    try {
+      // SDK signature: candlesticks(symbol, period, count, adjustType, tradeSessions)
+      const raw = (await (this.quoteCtx as unknown as {
+        candlesticks: (symbol: string, period: number, count: number, adjustType: number, tradeSessions: number) => Promise<LongbridgeCandlestickLike[]>
+      }).candlesticks(symbol, period, count, LB_ADJUST_NO_ADJUST, LB_TRADE_SESSIONS_ALL)) ?? []
+
+      // Longbridge returns oldest-first; bar service expects newest-first.
+      return raw
+        .reverse()
+        .map(c => ({
+          timestamp: c.timestamp,
+          open: String(c.open),
+          high: String(c.high),
+          low: String(c.low),
+          close: String(c.close),
+          volume: String(c.volume),
+        }))
+    } catch (err) {
+      throw BrokerError.from(err)
     }
   }
 
@@ -758,4 +826,20 @@ function isWithinSession(
   if (beginMin <= endMin) return nowMin >= beginMin && nowMin <= endMin
   // Cross-midnight session (e.g. US overnight when viewed from Asia TZ)
   return nowMin >= beginMin || nowMin <= endMin
+}
+
+// ==================== Bar interval mapping ====================
+
+/** Map normalized {@link BarInterval} to Longbridge Period enum values. */
+function barIntervalToLbPeriod(interval: string): number | null {
+  switch (interval) {
+    case '1m':  return LB_PERIOD_MIN1
+    case '5m':  return LB_PERIOD_MIN5
+    case '15m': return LB_PERIOD_MIN15
+    case '30m': return LB_PERIOD_MIN30
+    case '1h':  return LB_PERIOD_MIN60
+    case '1d':  return LB_PERIOD_DAY
+    case '1w':  return LB_PERIOD_WEEK
+    default:    return null
+  }
 }

@@ -123,3 +123,14 @@ export interface LongbridgeMarketSessionLike {
     tradeSession: number
   }>
 }
+
+/** Subset of {@link Candlestick} we read from QuoteContext.candlesticks(). */
+export interface LongbridgeCandlestickLike {
+  close: { toString(): string }
+  open: { toString(): string }
+  high: { toString(): string }
+  low: { toString(): string }
+  volume: { toString(): string }
+  turnover: { toString(): string }
+  timestamp: Date
+}

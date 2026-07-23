@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import Decimal from 'decimal.js'
 import { Contract, Order } from '@traderalice/ibkr'
+import { Decimal as LongbridgeDecimal } from 'longbridge'
 import { LongbridgeBroker, ibkrOrderTypeToLb, ibkrTifToLb } from './LongbridgeBroker.js'
 import { makeContract, parseLbSymbol, resolveSymbol, mapLbOrderStatus } from './longbridge-contracts.js'
 import '../../contract-ext.js'
@@ -8,6 +9,13 @@ import '../../contract-ext.js'
 // ==================== Longbridge SDK mock ====================
 
 vi.mock('longbridge', () => {
+  // Mock SDK Decimal class that mirrors longbridge.Decimal
+  class MockLongbridgeDecimal {
+    private readonly value: string
+    constructor(value: string | number) { this.value = String(value) }
+    toString(): string { return this.value }
+  }
+
   // Numeric enum values mirror the const enum in node_modules/longbridge/index.d.ts.
   const OrderSide = { Unknown: 0, Buy: 1, Sell: 2 } as const
   const OrderType = {
@@ -15,9 +23,18 @@ vi.mock('longbridge', () => {
     LIT: 7, MIT: 8, TSLPAMT: 9, TSLPPCT: 10, TSMAMT: 11, TSMPCT: 12, SLO: 13,
   } as const
   const TimeInForceType = { Unknown: 0, Day: 1, GoodTilCanceled: 2, GoodTilDate: 3 } as const
+  // Longbridge SDK Period enum: Unknown=0, Min_1=1, Min_2=2, Min_3=3, Min_5=4, Min_10=5,
+  // Min_15=6, Min_20=7, Min_30=8, Min_45=9, Min_60=10, Min_120=11, Min_180=12, Min_240=13,
+  // Day=14, Week=15, Month=16, Quarter=17, Year=18
+  const Period = { Min1: 1, Min5: 4, Min15: 6, Min30: 8, Min60: 10, Day: 14, Week: 15, Month: 16 } as const
+  // Longbridge SDK AdjustType enum: NoAdjust=0, ForwardAdjust=1
+  const AdjustType = { NoAdjust: 0, ForwardAdjust: 1 } as const
+  // Longbridge SDK TradeSessions enum: Intraday=0, All=1
+  const TradeSessions = { Intraday: 0, All: 1 } as const
   const Market = { Unknown: 0, US: 1, HK: 2, CN: 3, SG: 4, Crypto: 5 } as const
 
   return {
+    Decimal: MockLongbridgeDecimal,
     Config: { fromApikey: vi.fn(() => ({ __config: true })) },
     TradeContext: {
       new: vi.fn(() => ({
@@ -35,14 +52,23 @@ vi.mock('longbridge', () => {
         depth: vi.fn(),
         staticInfo: vi.fn(),
         tradingSession: vi.fn(),
+        candlesticks: vi.fn(),
       })),
     },
     OrderSide,
     OrderType,
     TimeInForceType,
+    Period,
+    AdjustType,
+    TradeSessions,
     Market,
   }
 })
+
+function expectLongbridgeDecimal(value: unknown, expected: string): void {
+  expect(value).toBeInstanceOf(LongbridgeDecimal)
+  expect(String(value)).toBe(expected)
+}
 
 // Helper: stamp mock contexts onto a freshly-constructed broker so we can
 // drive method outcomes without going through init().
@@ -65,6 +91,7 @@ function attachMockContexts(broker: LongbridgeBroker): {
     tradingSession: vi.fn(),
     optionQuote: vi.fn(),
     warrantQuote: vi.fn(),
+    candlesticks: vi.fn(),
   }
   ;(broker as unknown as { tradeCtx: typeof trade; quoteCtx: typeof quote }).tradeCtx = trade
   ;(broker as unknown as { tradeCtx: typeof trade; quoteCtx: typeof quote }).quoteCtx = quote
@@ -798,6 +825,110 @@ describe('LongbridgeBroker — getMarketClock()', () => {
   })
 })
 
+// ==================== getHistorical() ====================
+
+describe('LongbridgeBroker — getHistorical()', () => {
+  it('returns bars in newest-first order from candlesticks()', async () => {
+    const b = makeBroker()
+    const { quote } = attachMockContexts(b)
+    quote.candlesticks.mockResolvedValue([
+      { close: dec('100'), open: dec('99'), high: dec('101'), low: dec('98'), volume: dec('5000'), turnover: dec('500000'), timestamp: new Date('2026-07-20T10:00:00Z') },
+      { close: dec('102'), open: dec('100'), high: dec('103'), low: dec('99'), volume: dec('6000'), turnover: dec('600000'), timestamp: new Date('2026-07-21T10:00:00Z') },
+      { close: dec('105'), open: dec('102'), high: dec('106'), low: dec('101'), volume: dec('7000'), turnover: dec('700000'), timestamp: new Date('2026-07-22T10:00:00Z') },
+    ])
+
+    const bars = await b.getHistorical(makeContract('700.HK'), { interval: '1d', limit: 3 })
+    expect(bars).toHaveLength(3)
+    // Should be reversed: newest first
+    expect(bars[0].timestamp).toEqual(new Date('2026-07-22T10:00:00Z'))
+    expect(bars[0].close).toBe('105')
+    expect(bars[2].timestamp).toEqual(new Date('2026-07-20T10:00:00Z'))
+    expect(bars[2].close).toBe('100')
+  })
+
+  it('maps 5m interval to Period.Min5', async () => {
+    const b = makeBroker()
+    const { quote } = attachMockContexts(b)
+    quote.candlesticks.mockResolvedValue([])
+
+    await b.getHistorical(makeContract('AAPL.US'), { interval: '5m', limit: 10 })
+    expect(quote.candlesticks).toHaveBeenCalledWith(
+      'AAPL.US',
+      4 /* Min5 */,
+      10 /* count */,
+      0 /* NoAdjust */,
+      1 /* All */,
+    )
+  })
+
+  it('maps 1h interval to Period.Min60', async () => {
+    const b = makeBroker()
+    const { quote } = attachMockContexts(b)
+    quote.candlesticks.mockResolvedValue([])
+
+    await b.getHistorical(makeContract('700.HK'), { interval: '1h', limit: 50 })
+    expect(quote.candlesticks).toHaveBeenCalledWith(
+      '700.HK',
+      10 /* Min60 */,
+      50 /* count */,
+      0 /* NoAdjust */,
+      1 /* All */,
+    )
+  })
+
+  it('defaults limit to 100 when not specified', async () => {
+    const b = makeBroker()
+    const { quote } = attachMockContexts(b)
+    quote.candlesticks.mockResolvedValue([])
+
+    await b.getHistorical(makeContract('AAPL.US'), { interval: '1d' })
+    expect(quote.candlesticks).toHaveBeenCalledWith(
+      'AAPL.US',
+      14 /* Day */,
+      100 /* count */,
+      0 /* NoAdjust */,
+      1 /* All */,
+    )
+  })
+
+  it('returns empty array when SDK returns null/undefined', async () => {
+    const b = makeBroker()
+    const { quote } = attachMockContexts(b)
+    quote.candlesticks.mockResolvedValue(null)
+
+    const bars = await b.getHistorical(makeContract('700.HK'), { interval: '1d', limit: 10 })
+    expect(bars).toEqual([])
+  })
+
+  it('throws on unsupported interval', async () => {
+    const b = makeBroker()
+    attachMockContexts(b)
+    await expect(
+      b.getHistorical(makeContract('700.HK'), { interval: '4h', limit: 10 }),
+    ).rejects.toThrow(/not supported/)
+  })
+
+  it('throws when contract cannot be resolved', async () => {
+    const b = makeBroker()
+    attachMockContexts(b)
+    const c = new Contract()
+    c.symbol = ''
+    await expect(
+      b.getHistorical(c, { interval: '1d', limit: 10 }),
+    ).rejects.toThrow(/Cannot resolve/)
+  })
+
+  it('wraps SDK errors as BrokerError', async () => {
+    const b = makeBroker()
+    const { quote } = attachMockContexts(b)
+    quote.candlesticks.mockRejectedValue(new Error('symbol not found'))
+
+    await expect(
+      b.getHistorical(makeContract('FAKE.US'), { interval: '1d', limit: 10 }),
+    ).rejects.toThrow(/symbol not found/)
+  })
+})
+
 // ==================== Capabilities + identity ====================
 
 describe('LongbridgeBroker — capabilities + identity', () => {
@@ -807,6 +938,17 @@ describe('LongbridgeBroker — capabilities + identity', () => {
     expect(cap.supportedSecTypes).toContain('STK')
     expect(cap.supportedOrderTypes).toContain('MKT')
     expect(cap.supportedOrderTypes).toContain('LMT')
+  })
+
+  it('declares historicalBars capability', () => {
+    const b = makeBroker()
+    const cap = b.getCapabilities()
+    expect(cap.historicalBars).toBeDefined()
+    expect(cap.historicalBars!.supported).toBe(true)
+    expect(cap.historicalBars!.quality).toBe('realtime')
+    expect(cap.historicalBars!.supportedBarSizes).toContain('1d')
+    expect(cap.historicalBars!.supportedBarSizes).toContain('1h')
+    expect(cap.historicalBars!.supportedBarSizes).toContain('5m')
   })
 
   it('getNativeKey returns LB-suffixed symbol', () => {
@@ -820,6 +962,47 @@ describe('LongbridgeBroker — capabilities + identity', () => {
     const c = b.resolveNativeKey('AAPL.US')
     expect(c.symbol).toBe('AAPL')
     expect(c.exchange).toBe('SMART')
+  })
+
+  it('converts decimal.js submit values to SDK Decimal instances', async () => {
+    const b = makeBroker()
+    const { trade } = attachMockContexts(b)
+    trade.submitOrder.mockResolvedValue({ orderId: 'decimal-submit' })
+
+    const c = makeContract('AAPL.US')
+    const order = new Order()
+    order.action = 'BUY'
+    order.orderType = 'TRAIL LIMIT'
+    order.totalQuantity = new Decimal('1.25')
+    order.lmtPrice = new Decimal('201.125')
+    order.auxPrice = new Decimal('199.875')
+    order.trailingPercent = new Decimal('1.5')
+    order.tif = 'DAY'
+
+    await b.placeOrder(c, order)
+
+    const sent = trade.submitOrder.mock.calls[0][0]
+    expectLongbridgeDecimal(sent.submittedQuantity, '1.25')
+    expectLongbridgeDecimal(sent.submittedPrice, '201.125')
+    expectLongbridgeDecimal(sent.triggerPrice, '199.875')
+    expectLongbridgeDecimal(sent.trailingPercent, '1.5')
+  })
+
+  it('converts decimal.js replacement values to SDK Decimal instances', async () => {
+    const b = makeBroker()
+    const { trade } = attachMockContexts(b)
+    trade.replaceOrder.mockResolvedValue(undefined)
+
+    await b.modifyOrder('ord-1', {
+      totalQuantity: new Decimal('2.5'),
+      lmtPrice: new Decimal('202.25'),
+      auxPrice: new Decimal('198.75'),
+    })
+
+    const sent = trade.replaceOrder.mock.calls[0][0]
+    expectLongbridgeDecimal(sent.quantity, '2.5')
+    expectLongbridgeDecimal(sent.price, '202.25')
+    expectLongbridgeDecimal(sent.triggerPrice, '198.75')
   })
 })
 
